@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Posture Tracker – Eyes + Shoulders</title>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.13.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+
+<style>
+body { margin:0; background:black; overflow:hidden; }
+video, canvas { position:absolute; top:0; left:0; }
+#info {
+  position:absolute; top:10px; left:10px;
+  color:lime; font-family:monospace;
+  background:rgba(0,0,0,.65); padding:10px;
+  border-radius:6px; line-height:1.4; max-width:320px;
+}
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+<div id="info">Loading…</div>
+
+<script>
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+let detector;
+const INFERENCE_INTERVAL = 250; // 4 FPS
+let lastInference = 0;
+
+// ---------- UTIL ----------
+const kp = (n,k)=>k.find(p=>p.name===n);
+const mid = (a,b)=>({ x:(a.x+b.x)/2, y:(a.y+b.y)/2 });
+function smooth(prev, next, alpha=0.2){ return prev==null?next:prev+alpha*(next-prev); }
+
+// ---------- STATE ----------
+let state = {
+  shoulderTilt:null,
+  correctedShoulderTilt:null,
+  shoulderHeightDiff:null,
+  eyeTilt:null,
+  ls:null, rs:null, le:null, re:null
+};
+
+// ---------- METRICS ----------
+function getEyeTilt(kps){
+  const le = kp("left_eye", kps), re = kp("right_eye", kps);
+  if(!le||!re||le.score<0.5||re.score<0.5) return null;
+  return Math.atan2(re.y-le.y,re.x-le.x)*180/Math.PI;
+}
+
+function updateMetrics(kps){
+  const ls = kp("left_shoulder", kps), rs = kp("right_shoulder", kps);
+  const le = kp("left_eye", kps), re = kp("right_eye", kps);
+  if([ls,rs,le,re].some(p=>!p||p.score<0.5)) return;
+
+  const rawTilt = Math.atan2(rs.y-ls.y, rs.x-ls.x)*180/Math.PI;
+  const eyes = getEyeTilt(kps);
+  const corrected = eyes!=null ? rawTilt - eyes : rawTilt;
+  const heightDiff = ls.y - rs.y;
+
+  state.shoulderTilt = smooth(state.shoulderTilt, rawTilt);
+  state.correctedShoulderTilt = smooth(state.correctedShoulderTilt, corrected);
+  state.shoulderHeightDiff = smooth(state.shoulderHeightDiff, heightDiff);
+  state.eyeTilt = smooth(state.eyeTilt, eyes);
+
+  state.ls=ls; state.rs=rs; state.le=le; state.re=re;
+}
+
+// ---------- DRAW ----------
+function drawPoint(p,c){ ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2); ctx.fillStyle=c; ctx.fill(); }
+function drawLine(a,b,c,w=2){ ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.strokeStyle=c; ctx.lineWidth=w; ctx.stroke(); }
+
+// ---------- LOOP ----------
+async function loop(timestamp){
+  requestAnimationFrame(loop);
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(video,0,0);
+
+  if(detector && (timestamp - lastInference > INFERENCE_INTERVAL)){
+    lastInference = timestamp;
+    const poses = await detector.estimatePoses(video);
+    if(poses.length) updateMetrics(poses[0].keypoints);
+  }
+
+  // Draw shoulders + eyes
+  if(state.ls && state.rs){
+    drawLine(state.ls,state.rs,"lime",3);
+    drawPoint(state.ls,"lime"); drawPoint(state.rs,"lime");
+  }
+  if(state.le && state.re){
+    drawLine(state.le,state.re,"white",2);
+    drawPoint(state.le,"white"); drawPoint(state.re,"white");
+  }
+
+  // Guidance based on eye-corrected shoulder tilt
+  let guidance=[];
+  if(state.correctedShoulderTilt!=null){
+    if(state.correctedShoulderTilt>2) guidance.push("Lower left shoulder slightly");
+    else if(state.correctedShoulderTilt<-2) guidance.push("Lower right shoulder slightly");
+    else guidance.push("Shoulders level");
+  }
+
+  document.getElementById("info").innerHTML=`
+<b>Shoulders (eye-corrected)</b><br>
+Raw tilt: ${state.shoulderTilt?.toFixed(2)??"—"}°<br>
+Eye tilt: ${state.eyeTilt?.toFixed(2)??"—"}°<br>
+Corrected tilt: ${state.correctedShoulderTilt?.toFixed(2)??"—"}°<br>
+Height Δ: ${state.shoulderHeightDiff?.toFixed(1)??"—"} px<br><br>
+<b>Guidance</b><br>${guidance.join("<br>")}
+`;
+}
+
+// ---------- START ----------
+async function main(){
+  const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"user"}});
+  video.srcObject = stream;
+
+  // Wait until video is ready
+  await new Promise(resolve=>{
+    video.onloadeddata = ()=>{ if(video.readyState >= 4) resolve(); };
+  });
+
+  await video.play();
+  await new Promise(r=>setTimeout(r,100)); // tiny delay
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  detector = await poseDetection.createDetector(
+    poseDetection.SupportedModels.MoveNet,
+    { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
+  );
+
+  await detector.estimatePoses(video); // warmup
+
+  requestAnimationFrame(loop);
+}
+
+main();
+</script>
+</body>
+</html>
