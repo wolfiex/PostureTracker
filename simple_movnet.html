@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>MoveNet – Persistent Pose (3 FPS)</title>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.15.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+
+<style>
+  body { margin: 0; background: black; overflow: hidden; }
+  video, canvas { position: absolute; top: 0; left: 0; }
+  #info {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: lime;
+    font-family: monospace;
+    background: rgba(0,0,0,0.6);
+    padding: 8px;
+    border-radius: 6px;
+  }
+</style>
+</head>
+
+<body>
+
+<video id="video" autoplay playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="info">Loading…</div>
+
+<script>
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const info = document.getElementById("info");
+
+const FPS = 3;
+const FRAME_INTERVAL = 1000 / FPS;
+
+let detector;
+let lastInferenceTime = 0;
+
+// 🔒 PERSISTED STATE
+let lastKeypoints = null;
+let lastMetrics = {
+  shoulderHeight: null,
+  shoulderTilt: null,
+  headNeckAngle: null
+};
+
+// ---------- CAMERA ----------
+async function setupCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480 }
+  });
+  video.srcObject = stream;
+  return new Promise(r => video.onloadedmetadata = r);
+}
+
+// ---------- HELPERS ----------
+const kp = (name, kps) => kps.find(k => k.name === name);
+
+function neckPoint(kps) {
+  const l = kp("left_shoulder", kps);
+  const r = kp("right_shoulder", kps);
+  if (!l || !r || l.score < 0.4 || r.score < 0.4) return null;
+  return { x: (l.x + r.x)/2, y: (l.y + r.y)/2 };
+}
+
+function computeMetrics(kps) {
+  const l = kp("left_shoulder", kps);
+  const r = kp("right_shoulder", kps);
+  const nose = kp("nose", kps);
+  const neck = neckPoint(kps);
+
+  if (!l || !r || !nose || !neck) return;
+
+  lastMetrics.shoulderHeight = ((l.y + r.y) / 2).toFixed(1);
+  lastMetrics.shoulderTilt =
+    (Math.atan2(r.y - l.y, r.x - l.x) * 180 / Math.PI).toFixed(1);
+
+  lastMetrics.headNeckAngle =
+    (Math.atan2(nose.x - neck.x, neck.y - nose.y) * 180 / Math.PI).toFixed(1);
+}
+
+// ---------- DRAW ----------
+function drawPoint(p, color) {
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function drawLine(a, b, color) {
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function drawLastPose() {
+  if (!lastKeypoints) return;
+
+  const l = kp("left_shoulder", lastKeypoints);
+  const r = kp("right_shoulder", lastKeypoints);
+  const nose = kp("nose", lastKeypoints);
+  const neck = neckPoint(lastKeypoints);
+
+  if (l && r && l.score > 0.4 && r.score > 0.4) {
+    drawLine(l, r, "cyan");
+    drawPoint(l, "lime");
+    drawPoint(r, "lime");
+  }
+
+  if (nose && neck && nose.score > 0.4) {
+    drawLine(neck, nose, "yellow");
+    drawPoint(neck, "red");
+    drawPoint(nose, "yellow");
+  }
+}
+
+// ---------- LOOP ----------
+async function loop(time) {
+  requestAnimationFrame(loop);
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, 0, 0);
+
+  // Inference only at 3 FPS
+  if (time - lastInferenceTime >= FRAME_INTERVAL) {
+    lastInferenceTime = time;
+    const poses = await detector.estimatePoses(video);
+
+    if (poses.length) {
+      lastKeypoints = poses[0].keypoints;
+      computeMetrics(lastKeypoints);
+    }
+  }
+
+  // 🔁 Always redraw last known pose
+  drawLastPose();
+
+  info.innerHTML = `
+FPS: ${FPS}<br>
+Shoulder height: ${lastMetrics.shoulderHeight ?? "—"} px<br>
+Shoulder tilt: ${lastMetrics.shoulderTilt ?? "—"}°<br>
+Head–neck angle: ${lastMetrics.headNeckAngle ?? "—"}°
+`;
+}
+
+// ---------- START ----------
+async function main() {
+  await setupCamera();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  detector = await poseDetection.createDetector(
+    poseDetection.SupportedModels.MoveNet,
+    { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
+  );
+
+  requestAnimationFrame(loop);
+}
+
+main();
+</script>
+
+</body>
+</html>
